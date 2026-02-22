@@ -11,7 +11,13 @@ import analyzeRoutes from './routes/analyze.js';
 import jobRoutes from './routes/jobs.js';
 import resultRoutes from './routes/results.js';
 import healthRoutes from './routes/health.js';
+import path from "path";
 
+app.use(require("express").static(path.join(process.cwd(), "public")));
+
+app.get("*", (req, res) => {
+  res.sendFile(path.join(process.cwd(), "public/index.html"));
+});
 async function buildServer() {
     const fastify = Fastify({
         logger: false, // We use our own pino logger
