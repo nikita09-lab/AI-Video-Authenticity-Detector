@@ -1,0 +1,35 @@
+{
+  "name": "vidauth-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "AI Video Authenticity Detector - API Gateway & Worker",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "dev:worker": "node --watch src/workers/videoProcessor.js",
+    "start": "node src/server.js",
+    "start:worker": "node src/workers/videoProcessor.js",
+    "db:generate": "npx prisma generate",
+    "db:push": "npx prisma db push",
+    "db:studio": "npx prisma studio"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.0",
+    "@fastify/multipart": "^9.0.0",
+    "@fastify/rate-limit": "^10.0.0",
+    "@fastify/static": "^8.0.0",
+    "@fastify/websocket": "^11.0.0",
+    "@prisma/client": "^6.4.0",
+    "bullmq": "^5.0.0",
+    "dotenv": "^16.4.0",
+    "fastify": "^5.0.0",
+    "ioredis": "^5.4.0",
+    "nanoid": "^5.0.0",
+    "pino": "^9.0.0",
+    "pino-pretty": "^13.0.0",
+    "undici": "^7.0.0"
+  },
+  "devDependencies": {
+    "prisma": "^6.4.0"
+  }
+}

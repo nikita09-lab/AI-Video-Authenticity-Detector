@@ -1,0 +1,738 @@
+# AI Video Authenticity Detector — System Architecture & Implementation Plan
+
+> **Project Owner:** 2nd-year B.Tech AIML student
+> **Goals:** Hackathon-ready MVP → Resume portfolio piece → Production deployment
+
+---
+
+## 1. High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              CLIENTS                                    │
+│         Browser (React + Vite + Tailwind)   •   Future Mobile App       │
+└────────────────────────────┬────────────────────────────────────────────┘
+                             │ HTTPS / WebSocket
+                             ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     API GATEWAY  (Node.js / Fastify)                    │
+│  ┌──────────┐ ┌───────────┐ ┌────────────┐ ┌────────────────────────┐  │
+│  │  Auth     │ │  Upload   │ │  Jobs API  │ │  Results / History API │  │
+│  │  Routes   │ │  Routes   │ │  (status)  │ │  (GET results)         │  │
+│  └──────────┘ └─────┬─────┘ └─────┬──────┘ └────────────────────────┘  │
+│                     │             │                                     │
+│          ┌──────────▼─────────────▼──────┐                              │
+│          │     BullMQ  Job Queue         │◄──── Redis                   │
+│          └──────────┬────────────────────┘                              │
+└─────────────────────┼──────────────────────────────────────────────────┘
+                      │  Job dispatched
+                      ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│              VIDEO PROCESSING WORKER  (Node.js Worker Thread)           │
+│                                                                         │
+│   1. Download / accept uploaded video                                   │
+│   2. Validate format & duration                                         │
+│   3. Extract key frames (FFmpeg)                                        │
+│   4. Send frames → AI Microservice via HTTP                             │
+│   5. Aggregate per-frame predictions → final verdict                    │
+│   6. Store result in DB, notify client via WebSocket                    │
+└─────────────────────┬──────────────────────────────────────────────────┘
+                      │  HTTP (localhost:8000)
+                      ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│               AI INFERENCE MICROSERVICE  (Python / FastAPI)             │
+│                                                                         │
+│   • Loads model once at startup (kept in memory)                        │
+│   • Endpoint: POST /predict  (accepts base64 frame or image file)       │
+│   • Returns: { real_prob, fake_prob, features_used }                    │
+│   • GPU-optional: works on CPU, faster on GPU                           │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why This Shape?
+
+| Decision | Rationale |
+|---|---|
+| **3 separate processes** (API, Worker, AI) | Each can scale, crash, or restart independently. The Node.js event loop is never blocked by FFmpeg or PyTorch. |
+| **Queue between API and Worker** | Uploads return *instantly* with a job ID. The client polls or listens via WebSocket. Long videos never timeout. |
+| **Python is isolated** | Model loading, NumPy, PyTorch — all stay in their own process with their own memory. Node never touches them. |
+
+---
+
+## 2. Service Breakdown
+
+### 2.1 API Gateway — Fastify (Node.js)
+
+> **Why Fastify over Express?**
+> - **For a student:** Fastify has built-in schema validation (via JSON Schema), auto-generated Swagger docs, and a modern plugin system. You learn production patterns from day one.
+> - **For production:** Fastify is 2-3× faster than Express in benchmarks, has built-in logging (Pino), and first-class TypeScript support.
+
+**Responsibilities:**
+- Accept video uploads (multipart) with size limits (100 MB default)
+- Accept video URLs (YouTube / Instagram / X)
+- Enqueue processing jobs into BullMQ
+- Serve job status and results via REST + WebSocket
+- Rate limiting, CORS, helmet security headers
+
+**Key Routes:**
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/analyze/upload` | Multipart file upload → enqueue job |
+| `POST` | `/api/v1/analyze/url` | JSON body `{ url }` → enqueue job |
+| `GET` | `/api/v1/jobs/:jobId` | Poll job status & progress |
+| `GET` | `/api/v1/results/:jobId` | Get final analysis result |
+| `WS` | `/ws/jobs/:jobId` | Real-time progress updates |
+| `GET` | `/api/v1/health` | Health check for all services |
+
+---
+
+### 2.2 Video Processing Worker (Node.js + BullMQ)
+
+**Responsibilities:**
+1. Pick job from Redis queue
+2. If URL → download video using `yt-dlp` (subprocess)
+3. Validate: format (mp4/webm/mov), duration (≤ 10 min MVP), file size
+4. Extract frames using FFmpeg (subprocess, *not* a Node binding)
+5. Send frames to AI microservice via HTTP POST
+6. Aggregate per-frame scores into a final verdict
+7. Write result to database
+8. Emit WebSocket event to the API gateway (via Redis pub/sub)
+
+> **Why a separate worker and not inline in the API?**
+> FFmpeg and yt-dlp are CPU/IO-heavy subprocesses. Running them inside the request handler would block the event loop and timeout the HTTP connection. The queue pattern gives you: retry on failure, concurrency control, progress tracking, and dead-letter handling — all for free.
+
+---
+
+### 2.3 AI Inference Microservice (Python / FastAPI)
+
+> **Why FastAPI?**
+> - **For a student:** FastAPI auto-generates interactive API docs, has Pydantic validation, and is the standard in ML deployment.
+> - **For production:** Async-capable, plays perfectly with `uvicorn`, and has a massive ecosystem for ML serving.
+
+**Responsibilities:**
+- Load the detection model **once** at startup (`@app.on_event("startup")`)
+- Expose `POST /predict` — accepts a single frame (image bytes)
+- Expose `POST /predict/batch` — accepts multiple frames for efficiency
+- Return per-frame prediction: `{ real_prob, fake_prob, confidence, explanation }`
+- Expose `GET /health` for readiness probes
+
+---
+
+### 2.4 Queue System — BullMQ + Redis
+
+> **Why BullMQ over RabbitMQ?**
+> - **For a student:** BullMQ is pure Node.js, requires only Redis (which you already need for caching), and has a beautiful dashboard (Bull Board). Zero extra infrastructure.
+> - **For production:** BullMQ supports priorities, rate limiting, retries with exponential backoff, job events, and scales horizontally. RabbitMQ is more powerful but overkill until you have 10+ services.
+
+**Job Lifecycle:**
+
+```
+CREATED → WAITING → ACTIVE → [PROGRESS updates] → COMPLETED
+                                                  → FAILED (→ retry up to 3×)
+                                                  → DEAD (after all retries)
+```
+
+---
+
+## 3. Async Processing Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User (Browser)
+    participant A as API Gateway
+    participant Q as BullMQ (Redis)
+    participant W as Worker
+    participant AI as AI Microservice
+    participant DB as Database
+
+    U->>A: POST /analyze/upload (video file)
+    A->>A: Validate file (size, type)
+    A->>A: Save to temp storage (/tmp/uploads/)
+    A->>Q: Enqueue job { filePath, jobId }
+    A-->>U: 202 Accepted { jobId }
+
+    U->>A: WS /ws/jobs/:jobId (subscribe)
+
+    Q->>W: Dequeue job
+    W->>W: Extract frames via FFmpeg
+    W-->>A: Progress 30% (via Redis pub/sub)
+    A-->>U: WS: { progress: 30, stage: "extracting_frames" }
+
+    W->>AI: POST /predict/batch { frames[] }
+    AI-->>W: { predictions[] }
+    W-->>A: Progress 80%
+    A-->>U: WS: { progress: 80, stage: "analyzing" }
+
+    W->>W: Aggregate scores → final verdict
+    W->>DB: INSERT result
+    W-->>A: Progress 100%
+    A-->>U: WS: { progress: 100, stage: "complete", resultId }
+
+    U->>A: GET /results/:jobId
+    A->>DB: SELECT result
+    A-->>U: { verdict, confidence, explanation, timeline }
+```
+
+---
+
+## 4. Frame Extraction Strategy
+
+### The Problem
+Analyzing every frame of a 5-minute, 30fps video = **9,000 frames**. That's insanely slow and unnecessary.
+
+### The Strategy: Smart Sampling
+
+```
+Video (5 min, 30fps = 9000 frames)
+    │
+    ├── Step 1: Scene-change detection (FFmpeg `select='gt(scene,0.3)'`)
+    │           → Yields ~30-80 "scene-change" frames
+    │
+    ├── Step 2: Uniform sampling (1 frame per second as fallback)
+    │           → Yields ~300 frames
+    │
+    ├── Step 3: Merge & deduplicate
+    │           → ~100-200 unique frames
+    │
+    └── Step 4: Cap at MAX_FRAMES (configurable, default 60 for MVP)
+              → Final set: 60 frames sent to AI
+```
+
+**FFmpeg command for scene-change extraction:**
+```bash
+ffmpeg -i input.mp4 -vf "select='gt(scene,0.3)',showinfo" -vsync vfr frame_%04d.jpg
+```
+
+**FFmpeg command for uniform 1-fps sampling:**
+```bash
+ffmpeg -i input.mp4 -vf "fps=1" frame_%04d.jpg
+```
+
+> **Why this works:** Deepfakes tend to have artifacts at scene transitions, faces, and temporal boundaries. Scene-change frames catch the transitions; uniform sampling catches the rest. The cap keeps inference time predictable.
+
+---
+
+## 5. Model Loading Strategy
+
+```
+AI Microservice Startup
+    │
+    ├── 1. Check if model file exists in /models/
+    │      └── If not → download from HuggingFace (cached for next startup)
+    │
+    ├── 2. Load model into memory (CPU or GPU based on config)
+    │      └── For MVP: use a lightweight model (~50-200 MB)
+    │
+    ├── 3. Run a warm-up inference on a dummy image
+    │      └── Forces PyTorch to compile/optimize the graph
+    │
+    └── 4. Mark service as READY (health endpoint returns 200)
+```
+
+**Recommended Models (MVP → Production):**
+
+| Phase | Model | Size | Why |
+|---|---|---|---|
+| Phase 1 (MVP) | EfficientNet-B0 (pretrained on ImageNet, fine-tuned) | ~20 MB | Tiny, fast, good enough for demos |
+| Phase 2 | XceptionNet (FaceForensics++) | ~88 MB | The standard in deepfake detection research |
+| Phase 3 | Multi-model ensemble (Xception + EfficientNet + CLIP) | ~300 MB | Higher accuracy, production-grade |
+
+> **Low-resource strategy:** In development, always use CPU mode and the smallest model. GPU is a production optimization.
+
+---
+
+## 6. Storage Design
+
+### 6.1 Temporary Video Storage
+
+```
+/tmp/vidauth/
+    ├── uploads/          ← Raw uploaded files (deleted after 1 hour)
+    │   └── {jobId}.mp4
+    ├── downloads/        ← Videos downloaded from URLs (deleted after 1 hour)
+    │   └── {jobId}.mp4
+    └── frames/           ← Extracted frames (deleted after processing)
+        └── {jobId}/
+            ├── frame_0001.jpg
+            ├── frame_0002.jpg
+            └── ...
+```
+
+**Cleanup policy:**
+- A cron job (or BullMQ scheduled job) runs every 30 minutes
+- Deletes any file older than 1 hour in `uploads/` and `downloads/`
+- `frames/` are deleted immediately after the AI returns predictions
+
+### 6.2 Results Database — PostgreSQL
+
+> **Why PostgreSQL?**
+> - **For a student:** Free, widely documented, excellent for learning SQL. Every job posting asks for it.
+> - **For production:** JSONB columns let you store flexible prediction data without schema headaches. Full-text search, indexing, and ACID compliance. Scales vertically very far before you need sharding.
+> - **Why not MongoDB?** Your data is inherently relational (users → jobs → results). PostgreSQL with JSONB gives you the flexibility of NoSQL with the reliability of SQL.
+
+**Schema:**
+
+```sql
+-- Jobs table
+CREATE TABLE jobs (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    status        VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending|processing|completed|failed
+    source_type   VARCHAR(10) NOT NULL,                    -- 'upload' | 'url'
+    source_url    TEXT,
+    file_size     BIGINT,
+    duration_sec  REAL,
+    frame_count   INT,
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ DEFAULT NOW(),
+    completed_at  TIMESTAMPTZ
+);
+
+-- Results table (1:1 with jobs, separated for query efficiency)
+CREATE TABLE results (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id        UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    verdict       VARCHAR(10) NOT NULL,    -- 'REAL' | 'AI_GENERATED'
+    confidence    REAL NOT NULL,           -- 0.0 to 1.0
+    real_prob     REAL NOT NULL,
+    fake_prob     REAL NOT NULL,
+    explanation   TEXT NOT NULL,           -- human-readable summary
+    frame_scores  JSONB NOT NULL,          -- per-frame breakdown
+    timeline      JSONB NOT NULL,          -- processing timeline
+    model_version VARCHAR(50),
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_jobs_status ON jobs(status);
+CREATE INDEX idx_results_job_id ON results(job_id);
+```
+
+> **For Phase 1 (MVP / Hackathon):** Use **SQLite** via `better-sqlite3`. Zero setup, single file, perfect for a demo. Migrate to PostgreSQL in Phase 2 by swapping the ORM config (use **Prisma** so the switch is painless).
+
+---
+
+## 7. Caching Strategy
+
+| Layer | Tool | What's Cached | TTL |
+|---|---|---|---|
+| **API Response** | Redis | Completed job results (by jobId) | 24 hours |
+| **URL De-duplication** | Redis | Hash of video URL → existing jobId | 1 hour |
+| **Model** | In-memory (Python) | The loaded PyTorch model | Forever (until restart) |
+| **Warm frames** | Filesystem | Extracted frames during processing | Until job completes |
+
+**URL De-duplication Flow:**
+```
+User submits URL → Hash the URL → Check Redis
+    ├── HIT  → Return existing jobId instantly (don't re-process)
+    └── MISS → Create new job, store hash → jobId in Redis
+```
+
+> This is a hackathon *wow factor*: "We already analyzed this video 10 minutes ago — here are the results instantly!"
+
+---
+
+## 8. Error Handling Strategy
+
+### Error Categories & Responses
+
+| Category | Example | HTTP Code | Action |
+|---|---|---|---|
+| **Validation** | File too large, invalid URL | `400` | Return clear message, no retry |
+| **Download Failure** | YouTube video is private | `422` | Mark job as failed, notify user |
+| **Processing** | FFmpeg crashes mid-extraction | `500` | Retry up to 3× with backoff |
+| **AI Service Down** | Python microservice not running | `503` | Retry with backoff, alert admin |
+| **Timeout** | Video processing > 5 minutes | `504` | Kill job, mark as timed out |
+
+### Structured Error Response
+
+```json
+{
+  "error": {
+    "code": "VIDEO_TOO_LARGE",
+    "message": "Video file exceeds the 100 MB limit. Please upload a shorter video.",
+    "details": { "maxSize": "100MB", "receivedSize": "256MB" }
+  }
+}
+```
+
+### BullMQ Retry Policy
+
+```javascript
+{
+  attempts: 3,
+  backoff: {
+    type: 'exponential',
+    delay: 5000  // 5s → 10s → 20s
+  }
+}
+```
+
+---
+
+## 9. Config: Local vs. Production
+
+| Setting | Local Development | Production |
+|---|---|---|
+| **Database** | SQLite (single file) | PostgreSQL (managed, e.g., Supabase) |
+| **Redis** | Local Redis or `ioredis-mock` | Managed Redis (Upstash / ElastiCache) |
+| **AI Model** | EfficientNet-B0, CPU mode | XceptionNet ensemble, GPU |
+| **Video storage** | Local filesystem `/tmp/` | S3 / Cloudflare R2 |
+| **Max file size** | 50 MB | 500 MB |
+| **Max video duration** | 2 minutes | 10 minutes |
+| **Worker concurrency** | 1 job at a time | 5 concurrent jobs per worker |
+| **CORS** | `localhost:5173` | Your domain only |
+| **Log level** | `debug` | `warn` |
+
+**Implementation:** Use `dotenv` with `.env.development` and `.env.production` files. Fastify reads `process.env.NODE_ENV` to pick the right config.
+
+---
+
+## 10. Performance & Scaling
+
+### 10.1 Processing Long Videos Efficiently
+
+1. **Cap video duration** — Reject videos over a configurable max (2 min local, 10 min prod)
+2. **Smart frame sampling** — Never process all frames (see Section 4)
+3. **Batch inference** — Send frames in batches of 8-16 to the AI service to maximize throughput
+4. **Stream extraction** — FFmpeg writes frames to disk as it extracts; the worker starts sending them to AI as they appear (pipeline parallelism)
+
+### 10.2 Never Block the Node.js Event Loop
+
+| Operation | Danger Level | Solution |
+|---|---|---|
+| FFmpeg | 🔴 High | Spawn as child process (`child_process.spawn`) — runs in OS process |
+| yt-dlp | 🔴 High | Same — child process |
+| File I/O | 🟡 Medium | Use `fs.promises` (async), never `fs.readFileSync` |
+| JSON parsing large results | 🟡 Medium | Use streaming JSON parser for results > 1 MB |
+| HTTP call to AI service | 🟢 Low | Already async (`fetch` / `axios`) |
+| Database queries | 🟢 Low | Already async (Prisma / pg driver) |
+
+### 10.3 Job Queue — BullMQ
+
+```
+                  ┌─────────────────┐
+                  │     Redis        │
+                  │  (job storage)   │
+                  └───────┬─────────┘
+                          │
+          ┌───────────────┼───────────────┐
+          ▼               ▼               ▼
+    ┌──────────┐   ┌──────────┐   ┌──────────┐
+    │ Worker 1 │   │ Worker 2 │   │ Worker 3 │
+    │ (Node)   │   │ (Node)   │   │ (Node)   │
+    └──────────┘   └──────────┘   └──────────┘
+```
+
+- **Local:** 1 worker, concurrency = 1
+- **Production:** N workers (one per CPU core), concurrency = 3-5 per worker
+- Workers are **stateless** — spin up more to handle load
+
+### 10.4 Horizontal Scaling Plan
+
+```
+Phase 1 (Hackathon):    1 API + 1 Worker + 1 AI service (all on laptop)
+Phase 2 (Deploy):       1 API + 2 Workers + 1 AI service (single VPS)
+Phase 3 (Scale):        Load Balancer → N API instances
+                        N Workers (auto-scaled by queue depth)
+                        AI service behind its own load balancer (GPU instances)
+```
+
+---
+
+## 11. AIML Depth — How Deepfake Detection Works
+
+### 11.1 What Features Do Detectors Look For?
+
+| Feature Category | What the Model Sees | Why It Matters |
+|---|---|---|
+| **Facial artifacts** | Blurred edges around face, inconsistent skin texture | GANs struggle with fine facial details |
+| **Eye/teeth anomalies** | Mismatched reflections, irregular pupil shapes | Very hard for AI to get right |
+| **Temporal inconsistency** | Flickering, jitter between consecutive frames | Frame-by-frame generation creates discontinuities |
+| **Compression artifacts** | Unusual patterns in DCT coefficients (JPEG blocks) | AI-generated images have different compression signatures |
+| **Frequency-domain signals** | Spectral analysis reveals periodic patterns from GAN upsampling | The "GAN fingerprint" — invisible to humans, obvious to classifiers |
+| **Blending boundaries** | Halo effects where a generated face meets the real background | Face-swap tools leave blending seams |
+
+### 11.2 How Frame Aggregation Works
+
+```
+Frame 1  → Model → { real: 0.3, fake: 0.7 }
+Frame 2  → Model → { real: 0.2, fake: 0.8 }
+Frame 3  → Model → { real: 0.9, fake: 0.1 }   ← outlier (maybe a clean frame)
+Frame 4  → Model → { real: 0.25, fake: 0.75 }
+...
+Frame 60 → Model → { real: 0.15, fake: 0.85 }
+
+Aggregation Strategies:
+┌──────────────────┬────────────────────────────────────────┐
+│ Strategy         │ How It Works                           │
+├──────────────────┼────────────────────────────────────────┤
+│ Mean Pooling     │ Average all frame scores               │
+│                  │ Simple but sensitive to outliers        │
+├──────────────────┼────────────────────────────────────────┤
+│ Median Pooling   │ Take the median score                  │
+│                  │ Robust to outlier frames ✅             │
+├──────────────────┼────────────────────────────────────────┤
+│ Weighted Voting  │ Weight scores by frame quality/face    │
+│                  │ confidence — best accuracy ✅           │
+├──────────────────┼────────────────────────────────────────┤
+│ Threshold Voting │ Count frames above a "fake" threshold  │
+│                  │ If >60% are fake → video is fake       │
+└──────────────────┴────────────────────────────────────────┘
+
+Recommended: Weighted median for MVP, weighted voting for production.
+```
+
+### 11.3 How Confidence Score Is Computed
+
+```python
+# Simplified confidence computation
+def compute_confidence(frame_predictions: list[float]) -> dict:
+    scores = np.array(frame_predictions)  # array of fake_probabilities
+
+    mean_score = np.mean(scores)
+    std_dev = np.std(scores)
+
+    # Verdict: if mean fake_prob > 0.5, it's likely AI-generated
+    verdict = "AI_GENERATED" if mean_score > 0.5 else "REAL"
+
+    # Confidence: how certain are we?
+    # High confidence = high mean AND low standard deviation
+    # (all frames agree → high confidence)
+    raw_confidence = abs(mean_score - 0.5) * 2  # scale 0-1
+    agreement_factor = max(0, 1 - std_dev * 2)  # penalize disagreement
+    confidence = raw_confidence * agreement_factor
+
+    return {
+        "verdict": verdict,
+        "confidence": round(confidence, 3),  # 0.0 to 1.0
+        "real_probability": round(1 - mean_score, 3),
+        "fake_probability": round(mean_score, 3),
+        "explanation": generate_explanation(verdict, confidence, std_dev)
+    }
+```
+
+**Explanation generation:**
+- Confidence > 0.8 → *"This video is very likely AI-generated. 95% of analyzed frames show signs of synthetic generation, particularly in facial regions."*
+- Confidence 0.5–0.8 → *"This video shows moderate signs of AI generation. Some frames appear synthetic while others look authentic."*
+- Confidence < 0.5 → *"Results are inconclusive. The video may contain a mix of real and generated content. Manual review recommended."*
+
+---
+
+## 12. Folder Structure
+
+```
+AI-Video-Authenticity-Detector/
+│
+├── frontend/                       # React + Vite + Tailwind
+│   ├── public/
+│   │   └── favicon.ico
+│   ├── src/
+│   │   ├── assets/                 # Static images, icons
+│   │   ├── components/             # Reusable UI components
+│   │   │   ├── VideoUploader.jsx
+│   │   │   ├── UrlInput.jsx
+│   │   │   ├── ProgressTracker.jsx
+│   │   │   ├── ResultCard.jsx
+│   │   │   ├── ConfidenceGauge.jsx
+│   │   │   └── FrameTimeline.jsx
+│   │   ├── pages/
+│   │   │   ├── HomePage.jsx
+│   │   │   ├── AnalyzePage.jsx
+│   │   │   └── ResultPage.jsx
+│   │   ├── hooks/
+│   │   │   ├── useJobStatus.js      # WebSocket + polling hook
+│   │   │   └── useVideoUpload.js    # Upload with progress
+│   │   ├── services/
+│   │   │   └── api.js               # Axios/fetch wrapper
+│   │   ├── utils/
+│   │   │   └── formatters.js
+│   │   ├── App.jsx
+│   │   ├── main.jsx
+│   │   └── index.css                # Tailwind directives
+│   ├── index.html
+│   ├── vite.config.js
+│   ├── tailwind.config.js
+│   ├── postcss.config.js
+│   └── package.json
+│
+├── backend/                        # Node.js + Fastify API & Worker
+│   ├── src/
+│   │   ├── server.js               # Fastify app bootstrap
+│   │   ├── config/
+│   │   │   ├── index.js            # Env-based config loader
+│   │   │   └── database.js         # DB connection config
+│   │   ├── routes/
+│   │   │   ├── analyze.js          # /api/v1/analyze/*
+│   │   │   ├── jobs.js             # /api/v1/jobs/*
+│   │   │   ├── results.js          # /api/v1/results/*
+│   │   │   └── health.js           # /api/v1/health
+│   │   ├── plugins/
+│   │   │   ├── websocket.js        # WS setup via @fastify/websocket
+│   │   │   ├── redis.js            # Redis connection plugin
+│   │   │   └── multer.js           # File upload plugin
+│   │   ├── workers/
+│   │   │   ├── videoProcessor.js   # Main BullMQ worker
+│   │   │   └── cleanup.js          # Temp file cleanup worker
+│   │   ├── services/
+│   │   │   ├── videoService.js     # Download, validate, extract frames
+│   │   │   ├── aiService.js        # HTTP client for AI microservice
+│   │   │   └── resultService.js    # Score aggregation & result building
+│   │   ├── queue/
+│   │   │   ├── connection.js       # BullMQ + Redis connection
+│   │   │   └── jobs.js             # Job definitions & options
+│   │   ├── db/
+│   │   │   ├── prisma/
+│   │   │   │   └── schema.prisma   # Database schema
+│   │   │   └── migrations/
+│   │   ├── middleware/
+│   │   │   ├── errorHandler.js
+│   │   │   ├── rateLimiter.js
+│   │   │   └── validator.js
+│   │   └── utils/
+│   │       ├── logger.js           # Pino logger config
+│   │       └── ffmpeg.js           # FFmpeg wrapper functions
+│   ├── .env.development
+│   ├── .env.production
+│   ├── .env.example
+│   └── package.json
+│
+├── ai-service/                     # Python + FastAPI
+│   ├── app/
+│   │   ├── main.py                 # FastAPI app, startup/shutdown
+│   │   ├── config.py               # Settings via pydantic-settings
+│   │   ├── routes/
+│   │   │   ├── predict.py          # POST /predict, POST /predict/batch
+│   │   │   └── health.py           # GET /health
+│   │   ├── models/
+│   │   │   ├── detector.py         # Model loading & inference logic
+│   │   │   └── schemas.py          # Pydantic request/response schemas
+│   │   ├── services/
+│   │   │   ├── preprocessing.py    # Image resize, normalize, augment
+│   │   │   └── explainability.py   # Generate human-readable explanations
+│   │   └── utils/
+│   │       └── device.py           # CPU/GPU detection
+│   ├── models/                     # Downloaded model weights (gitignored)
+│   │   └── .gitkeep
+│   ├── tests/
+│   │   ├── test_predict.py
+│   │   └── test_preprocessing.py
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── .env.example
+│
+├── docker-compose.yml              # Orchestrate all services
+├── docker-compose.dev.yml          # Dev overrides (volumes, hot reload)
+├── .gitignore
+├── .env.example
+└── README.md
+```
+
+---
+
+## 13. Dev Roadmap — Phase-Wise Plan
+
+### Phase 1 — MVP (Hackathon Ready) ⏱️ 2–3 weeks
+
+**Goal:** Working demo that accepts a video and returns a fake/real verdict.
+
+| Module | What to Build | Expected Output |
+|---|---|---|
+| **Frontend** | Upload form, URL input, progress bar, result card | A beautiful single-page app |
+| **Backend API** | Upload endpoint, URL endpoint, job status endpoint | REST API that enqueues jobs |
+| **Worker** | Download video, extract frames (FFmpeg), call AI service | Frames extracted and sent for analysis |
+| **AI Service** | Load a pretrained EfficientNet, classify single frames | Per-frame predictions returned |
+| **Integration** | Wire everything together, simple polling for status | End-to-end demo: upload → result |
+
+**Shortcuts for Phase 1:**
+- Use SQLite instead of PostgreSQL
+- Skip WebSocket — use polling (`setInterval` with `GET /jobs/:id`)
+- Use a pretrained ImageNet model (not fine-tuned for deepfakes) — the architecture matters more than accuracy for a hackathon
+- Skip authentication
+- Skip Docker — run all 3 services manually
+
+**Phase 1 deliverable:** A working demo you can present at a hackathon in under 3 minutes.
+
+---
+
+### Phase 2 — Real ML Integration ⏱️ 3–4 weeks
+
+**Goal:** Accurate deepfake detection with a proper model and robust backend.
+
+| Module | What to Build | Expected Output |
+|---|---|---|
+| **AI Service** | Integrate XceptionNet (FaceForensics++), batch inference | Accurate per-frame predictions |
+| **Backend** | PostgreSQL migration (via Prisma), WebSocket for real-time updates | Real-time progress, persistent results |
+| **Worker** | Smart frame extraction (scene-change + uniform), retry logic | Efficient, fault-tolerant processing |
+| **Frontend** | Result detail page with per-frame breakdown, confidence gauge, explanation text, history page | Professional-quality UI |
+| **Infra** | Docker Compose for all services, health checks | One-command startup: `docker compose up` |
+| **Testing** | API tests (Vitest), AI service tests (pytest) | CI-ready test suite |
+
+**Phase 2 deliverable:** A production-worthy system that accurately detects deepfakes and looks portfolio-ready.
+
+---
+
+### Phase 3 — Production Scaling ⏱️ 4–6 weeks
+
+**Goal:** Deploy to cloud with monitoring, auth, and scaling.
+
+| Module | What to Build | Expected Output |
+|---|---|---|
+| **Auth** | JWT-based auth (or OAuth via Google) | User accounts, history per user |
+| **Rate limiting** | Per-IP and per-user rate limits | Abuse prevention |
+| **Storage** | S3/R2 for video uploads, CDN for results | Scalable storage |
+| **Monitoring** | Prometheus metrics, Grafana dashboards, error tracking (Sentry) | Full observability |
+| **Deployment** | CI/CD (GitHub Actions), deploy to Railway / Render / AWS | Automated deployments |
+| **AI Scaling** | GPU inference, model ensemble, ONNX optimization | Fast, accurate predictions |
+| **Horizontal scaling** | Multiple API instances behind NGINX, auto-scaled workers | Handle traffic spikes |
+
+**Phase 3 deliverable:** A production system accessible via a public URL with monitoring and auth.
+
+---
+
+## 14. Tech Decisions — Justifications
+
+| Decision | Why Best for Student | Why Production Correct |
+|---|---|---|
+| **Fastify** over Express | Built-in validation, auto Swagger docs, modern patterns | 2-3× faster, first-class TS, enterprise-adopted |
+| **Vite** over CRA | Instant HMR, 10× faster builds, modern defaults | Industry standard, better tree-shaking |
+| **Tailwind CSS** | Rapid prototyping, no context-switching to CSS files | Utility-first scales well, design system built-in |
+| **BullMQ** over RabbitMQ | Only needs Redis, great dashboard, pure JS | Battle-tested, scales horizontally, rich feature set |
+| **PostgreSQL** over MongoDB | Learn SQL (universal skill), JSONB for flexibility | ACID, relational integrity, scales far |
+| **Prisma** ORM | Auto-generated types, visual studio, migration tool | Type-safe, database-agnostic switching |
+| **FastAPI** over Flask | Auto docs, Pydantic validation, async-native | Production ML serving standard |
+| **FFmpeg** (subprocess) | Industry standard, massive community, free | More reliable than any Node binding, battle-proven |
+| **Docker Compose** | One command to start everything | Identical local and production environments |
+
+---
+
+## 15. Common Mistakes & How to Avoid Them
+
+| # | Mistake | Why It Happens | How to Avoid |
+|---|---|---|---|
+| 1 | **Blocking the Node.js event loop** with FFmpeg or heavy computation | Using synchronous methods or running FFmpeg inline | Always use `child_process.spawn()` and async file I/O |
+| 2 | **Not cleaning up temp files** | Forgetting to delete frames and videos after processing | Add a cleanup step at the end of every job + a scheduled cleanup worker |
+| 3 | **Loading the ML model on every request** | Treating the Python service like a stateless function | Load model ONCE at startup, keep in a global variable |
+| 4 | **No timeout on video downloads** | yt-dlp hangs on a slow server forever | Set a 60-second timeout on all child processes and HTTP calls |
+| 5 | **Sending full video to the AI service** | Misunderstanding the pipeline — models work on **frames**, not videos | Always extract frames first, send images to the AI service |
+| 6 | **Coupling frontend to backend** | Importing backend types or calling the backend directly at build time | Frontend communicates ONLY via HTTP API. Define a clear API contract |
+| 7 | **Hardcoding config values** | Putting `localhost:3000` directly in source code | Use `.env` files and a config module from day one |
+| 8 | **No error handling on the AI service** | If the model throws, the whole pipeline crashes silently | Wrap every inference call in try/catch, return structured errors |
+| 9 | **Ignoring CORS** | Frontend gets blocked by browser when calling backend API | Enable CORS on the Fastify server from the start with specific origins |
+| 10 | **Storing videos permanently** | Disk fills up within days | Delete temp files after processing; only store results in the DB |
+| 11 | **Not validating uploads** | Accepting any file type / size | Validate mime type, extension, and file size BEFORE saving to disk |
+| 12 | **Skipping the queue for "simplicity"** | Processing inline during the HTTP request, causing timeouts | Use the queue from Phase 1. BullMQ is simple to set up and saves you from rewrites later |
+
+---
+
+## Verification Plan
+
+Since this is a **planning-only deliverable** (no code), verification is:
+
+### User Review
+- Review the architecture diagram for completeness
+- Validate the tech stack choices against your constraints
+- Confirm the phase-wise roadmap aligns with your timeline
+- Approve the folder structure before we begin coding
+
+> [!IMPORTANT]
+> **Next Step:** Once you approve this plan, I will begin **Phase 1 implementation** — scaffolding all three services (frontend, backend, AI microservice) and wiring up the end-to-end upload → process → result flow.

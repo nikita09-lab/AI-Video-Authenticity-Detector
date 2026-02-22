@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Temp files
+tmp/
+*.tmp
+
+# Build
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model weights
+ai-service/models/*.pt
+ai-service/models/*.pth
+ai-service/models/*.onnx
+
+# Logs
+*.log

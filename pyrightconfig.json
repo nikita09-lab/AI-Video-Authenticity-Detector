@@ -1,0 +1,17 @@
+{
+    "pythonVersion": "3.9",
+    "pythonPlatform": "Windows",
+    "extraPaths": [
+        "C:\\Users\\Sneha\\AppData\\Local\\Programs\\Python\\Python39\\Lib\\site-packages",
+        "./ai-service"
+    ],
+    "exclude": [
+        "node_modules",
+        "frontend",
+        "backend"
+    ],
+    "reportMissingImports": false,
+    "reportMissingModuleSource": false,
+    "reportGeneralTypeIssues": false,
+    "typeCheckingMode": "off"
+}

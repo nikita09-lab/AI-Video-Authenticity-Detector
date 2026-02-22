@@ -1,0 +1,12 @@
+{
+    "pythonVersion": "3.9",
+    "pythonPlatform": "Windows",
+    "venvPath": "",
+    "extraPaths": [
+        "C:\\Users\\Sneha\\AppData\\Local\\Programs\\Python\\Python39\\Lib\\site-packages"
+    ],
+    "reportMissingImports": false,
+    "reportMissingModuleSource": false,
+    "reportGeneralTypeIssues": false,
+    "typeCheckingMode": "off"
+}
