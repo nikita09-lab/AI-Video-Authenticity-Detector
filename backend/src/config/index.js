@@ -33,6 +33,7 @@ const config = {
     maxFrames: parseInt(process.env.MAX_FRAMES || '30', 10),
     maxDurationSec: parseInt(process.env.MAX_DURATION_SEC || '300', 10), // 5 min
     ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
+    ytdlpPath: process.env.YTDLP_PATH || 'yt-dlp',
   },
 
   // BullMQ
