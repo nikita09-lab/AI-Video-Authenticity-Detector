@@ -9,21 +9,28 @@
 ## 🚀 Architecture
 
 ```
-Frontend (React/Vite)  →  Backend (Node.js/Fastify)  →  AI Service (Python/FastAPI)
-   Render Static Site        Render Web Service             Render Web Service
-                              + ffmpeg + yt-dlp              + OpenRouter API
+Single Render Web Service (Free Tier)
+┌─────────────────────────────────────────────────┐
+│  Docker Container                               │
+│                                                 │
+│  ┌─────────────────────────────────────────┐    │
+│  │  Node.js / Fastify  (public PORT)       │    │
+│  │   • Serves React frontend (/)           │    │
+│  │   • Serves API routes (/api/v1/*)       │    │
+│  └─────────────────────────────────────────┘    │
+│                     │ internal HTTP             │
+│  ┌─────────────────────────────────────────┐    │
+│  │  Python / FastAPI  (localhost:8001)     │    │
+│  │   • AI frame analysis (OpenRouter)      │    │
+│  └─────────────────────────────────────────┘    │
+│                                                 │
+│  + ffmpeg (frame extraction) + yt-dlp (DL)     │
+└─────────────────────────────────────────────────┘
 ```
 
 ---
 
-## ☁️ Deploy to Render (Step-by-Step)
-
-### Prerequisites
-- [GitHub account](https://github.com) with this repo pushed
-- [Render account](https://render.com) (free)
-- [OpenRouter API key](https://openrouter.ai) (free tier available)
-
----
+## ☁️ Deploy to Render (1 Free Web Service)
 
 ### Step 1 — Push to GitHub
 
@@ -35,25 +42,32 @@ git remote add origin https://github.com/YOUR_USERNAME/AI-Video-Authenticity-Det
 git push -u origin main
 ```
 
----
-
-### Step 2 — Deploy AI Service first
+### Step 2 — Create Web Service on Render
 
 1. Go to [render.com](https://render.com) → **New** → **Web Service**
 2. Connect your GitHub repo
 3. Configure:
-   | Setting | Value |
-   |---|---|
-   | **Root Directory** | `ai-service` |
-   | **Runtime** | **Docker** |
-   | **Dockerfile** | `ai-service/Dockerfile` |
-   | **Plan** | Free |
-4. Add **Environment Variables**:
-   | Key | Value |
-   |---|---|
-   | `OPENROUTER_API_KEY` | `sk-or-...` (your key) |
-   | `OPENROUTER_MODEL` | `google/gemini-2.0-flash-001` |
-5. Click **Deploy** — copy the URL (e.g. `https://vidauth-ai-service.onrender.com`)
+
+| Setting | Value |
+|---|---|
+| **Runtime** | **Docker** |
+| **Dockerfile Path** | `Dockerfile` (root level) |
+| **Docker Context** | `.` (repo root) |
+| **Plan** | Free |
+
+4. Add **Environment Variables** (only one required!):
+
+| Key | Value |
+|---|---|
+| `OPENROUTER_API_KEY` | `sk-or-...` from [openrouter.ai](https://openrouter.ai) |
+
+5. Click **Create Web Service** — Render builds and deploys everything automatically!
+
+> ✅ That's it! One service, one URL, free tier. No Redis, no separate frontend hosting needed.
+
+> ⚠️ **Free tier note:** Service sleeps after 15 min of inactivity. First request after sleep takes ~30s to wake up.
+
+---
 
 ---
 

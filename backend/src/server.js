@@ -12,6 +12,12 @@ import jobRoutes from './routes/jobs.js';
 import resultRoutes from './routes/results.js';
 import healthRoutes from './routes/health.js';
 
+import { existsSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
 async function buildServer() {
     const fastify = Fastify({
         logger: false, // We use our own pino logger
@@ -34,6 +40,19 @@ async function buildServer() {
         max: 100,
         timeWindow: '1 minute',
     });
+
+    // --- Serve React frontend in production ---
+    // The Docker build copies frontend/dist → backend/public
+    const publicDir = join(__dirname, '..', 'public');
+    if (existsSync(publicDir)) {
+        const fastifyStatic = (await import('@fastify/static')).default;
+        await fastify.register(fastifyStatic, {
+            root: publicDir,
+            prefix: '/',          // serve at /
+            wildcard: false,      // we'll handle SPA fallback manually
+        });
+        logger.info(`Serving frontend static files from: ${publicDir}`);
+    }
 
     // --- Global error handler ---
     fastify.setErrorHandler((error, request, reply) => {
@@ -68,18 +87,29 @@ async function buildServer() {
         });
     });
 
-    // --- Routes ---
+    // --- API Routes ---
     await fastify.register(analyzeRoutes);
     await fastify.register(jobRoutes);
     await fastify.register(resultRoutes);
     await fastify.register(healthRoutes);
 
-    // Root route
-    fastify.get('/', async () => ({
-        name: 'AI Video Authenticity Detector API',
-        version: '1.0.0',
-        docs: '/api/v1/health',
-    }));
+    // Root API info (dev only — in production, / serves the React app)
+    if (!existsSync(join(__dirname, '..', 'public'))) {
+        fastify.get('/', async () => ({
+            name: 'AI Video Authenticity Detector API',
+            version: '1.0.0',
+            docs: '/api/v1/health',
+        }));
+    }
+
+    // SPA fallback — return index.html for any unmatched route (React Router)
+    fastify.setNotFoundHandler(async (request, reply) => {
+        const indexFile = join(__dirname, '..', 'public', 'index.html');
+        if (existsSync(indexFile) && !request.url.startsWith('/api/')) {
+            return reply.type('text/html').sendFile('index.html', publicDir);
+        }
+        return reply.status(404).send({ error: { code: 'NOT_FOUND', message: `Route ${request.url} not found` } });
+    });
 
     return fastify;
 }
