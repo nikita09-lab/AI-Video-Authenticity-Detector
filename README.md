@@ -1,77 +1,211 @@
-<<<<<<< HEAD
-# AI-Video-Authenticity-Detector
-=======
-# AI Video Authenticity Detector
+# 🎬 VidAuth — AI Video Authenticity Detector
 
-> Detect whether a video is AI-generated or real using advanced visual forensics.
+> Detect deepfakes and AI-generated videos using frame-level vision AI analysis.
 
-## Quick Start
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
+
+---
+
+## 🚀 Architecture
+
+```
+Frontend (React/Vite)  →  Backend (Node.js/Fastify)  →  AI Service (Python/FastAPI)
+   Render Static Site        Render Web Service             Render Web Service
+                              + ffmpeg + yt-dlp              + OpenRouter API
+```
+
+---
+
+## ☁️ Deploy to Render (Step-by-Step)
 
 ### Prerequisites
-- Node.js 18+
-- Python 3.9+
-- FFmpeg installed and in PATH ([download here](https://ffmpeg.org/download.html))
-- (Optional) Redis for job queuing
+- [GitHub account](https://github.com) with this repo pushed
+- [Render account](https://render.com) (free)
+- [OpenRouter API key](https://openrouter.ai) (free tier available)
 
-### 1. Start the AI Service
+---
+
+### Step 1 — Push to GitHub
+
+```bash
+git init
+git add .
+git commit -m "Initial commit"
+git remote add origin https://github.com/YOUR_USERNAME/AI-Video-Authenticity-Detector.git
+git push -u origin main
+```
+
+---
+
+### Step 2 — Deploy AI Service first
+
+1. Go to [render.com](https://render.com) → **New** → **Web Service**
+2. Connect your GitHub repo
+3. Configure:
+   | Setting | Value |
+   |---|---|
+   | **Root Directory** | `ai-service` |
+   | **Runtime** | **Docker** |
+   | **Dockerfile** | `ai-service/Dockerfile` |
+   | **Plan** | Free |
+4. Add **Environment Variables**:
+   | Key | Value |
+   |---|---|
+   | `OPENROUTER_API_KEY` | `sk-or-...` (your key) |
+   | `OPENROUTER_MODEL` | `google/gemini-2.0-flash-001` |
+5. Click **Deploy** — copy the URL (e.g. `https://vidauth-ai-service.onrender.com`)
+
+---
+
+### Step 3 — Deploy Backend
+
+1. Go to Render → **New** → **Web Service**
+2. Connect your GitHub repo
+3. Configure:
+   | Setting | Value |
+   |---|---|
+   | **Root Directory** | `backend` |
+   | **Runtime** | **Docker** |
+   | **Dockerfile** | `backend/Dockerfile` |
+   | **Plan** | Free |
+4. Add **Environment Variables**:
+   | Key | Value |
+   |---|---|
+   | `NODE_ENV` | `production` |
+   | `AI_SERVICE_URL` | URL from Step 2 (e.g. `https://vidauth-ai-service.onrender.com`) |
+   | `CORS_ORIGIN` | Your frontend URL (fill in after Step 4, or use `*` temporarily) |
+   | `FFMPEG_PATH` | `ffmpeg` |
+   | `YTDLP_PATH` | `yt-dlp` |
+   | `MAX_FRAMES` | `10` |
+   | `TEMP_DIR` | `/tmp/vidauth` |
+5. Click **Deploy** — copy the URL (e.g. `https://vidauth-backend.onrender.com`)
+
+---
+
+### Step 4 — Deploy Frontend
+
+1. Go to Render → **New** → **Static Site**
+2. Connect your GitHub repo
+3. Configure:
+   | Setting | Value |
+   |---|---|
+   | **Root Directory** | `frontend` |
+   | **Build Command** | `npm install && npm run build` |
+   | **Publish Directory** | `dist` |
+4. Add **Environment Variables**:
+   | Key | Value |
+   |---|---|
+   | `VITE_API_BASE_URL` | URL from Step 3 (e.g. `https://vidauth-backend.onrender.com`) |
+5. Click **Deploy**
+
+---
+
+### Step 5 — Update CORS
+
+Go back to your **Backend** service on Render:
+- Update `CORS_ORIGIN` to your frontend URL (e.g. `https://vidauth-frontend.onrender.com`)
+- Click **Manual Deploy** → **Deploy latest commit**
+
+---
+
+## 🖥️ Run Locally
+
+### Prerequisites
+- Node.js 20+, Python 3.11+
+- FFmpeg installed (see below)
+- OpenRouter API key
+
+### Install FFmpeg (Windows)
 ```powershell
-# PowerShell (Windows)
+# Download standalone binary
+Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile "$env:TEMP\ffmpeg.zip"
+Expand-Archive "$env:TEMP\ffmpeg.zip" -DestinationPath "C:\ffmpeg"
+# Then set FFMPEG_PATH=C:\ffmpeg\ffmpeg-master-latest-win64-gpl\bin\ffmpeg.exe in backend/.env
+```
+
+### Install FFmpeg (Mac/Linux)
+```bash
+# Mac
+brew install ffmpeg
+
+# Ubuntu/Debian
+sudo apt install ffmpeg
+```
+
+### Start all services
+
+```powershell
+# Terminal 1 — AI Service
 cd ai-service
 pip install -r requirements.txt
 python -m uvicorn app.main:app --reload --port 8000
-```
 
-### 2. Start the Backend (new terminal)
-```powershell
-# PowerShell (Windows)
+# Terminal 2 — Backend
 cd backend
 npm install
-npm run dev
-```
+node src/server.js
 
-### 3. Start the Frontend (new terminal)
-```powershell
-# PowerShell (Windows)
+# Terminal 3 — Frontend
 cd frontend
 npm install
 npm run dev
 ```
 
-Open **http://localhost:5173** in your browser.
+Open → **http://localhost:5173**
 
-> **Note:** PowerShell does NOT support `&&` to chain commands. Use separate lines or `;` instead.
-> Example: `cd ai-service; python -m uvicorn app.main:app --reload --port 8000`
+---
 
-## Architecture
+## ⚙️ Environment Variables
+
+### `backend/.env`
+```env
+PORT=3001
+NODE_ENV=development
+AI_SERVICE_URL=http://localhost:8000
+CORS_ORIGIN=http://localhost:5173
+FFMPEG_PATH=C:\ffmpeg\...\ffmpeg.exe   # Windows path
+YTDLP_PATH=C:\ffmpeg\...\yt-dlp.exe   # Windows path
+MAX_FRAMES=30
+MAX_DURATION_SEC=300
+TEMP_DIR=./tmp
 ```
-Frontend (React + Vite + Tailwind)  :5173
-    ↓ API calls (proxied by Vite)
-Backend (Fastify + BullMQ)          :3001
-    ↓ HTTP
-AI Service (FastAPI + OpenRouter)   :8000
+
+### `ai-service/.env`
+```env
+OPENROUTER_API_KEY=sk-or-your-key-here
+OPENROUTER_MODEL=google/gemini-2.0-flash-001
+HOST=0.0.0.0
+PORT=8000
 ```
 
-## Tech Stack
+### `frontend/.env`
+```env
+# Leave blank for local dev (Vite proxy handles it)
+# Set to backend URL for production
+VITE_API_BASE_URL=
+```
+
+---
+
+## 📦 Tech Stack
+
 | Layer | Technology |
 |---|---|
-| Frontend | React 19, Vite, Tailwind CSS v4 |
-| Backend | Node.js, Fastify 5, BullMQ |
-| AI Service | Python, FastAPI, OpenRouter API |
-| Queue | Redis + BullMQ (optional for MVP) |
+| Frontend | React, Vite, Tailwind CSS v4 |
+| Backend | Node.js, Fastify, BullMQ |
+| AI Service | Python, FastAPI, httpx |
+| Video | FFmpeg (frame extraction), yt-dlp (platform downloads) |
+| AI Model | OpenRouter → Gemini 2.0 Flash Vision |
+| Deployment | Render (Docker + Static Site) |
 
-## Environment Variables
+---
 
-### Backend (`backend/.env`)
-| Variable | Default | Description |
-|---|---|---|
-| `PORT` | `3001` | API server port |
-| `AI_SERVICE_URL` | `http://127.0.0.1:8000` | AI microservice URL |
-| `REDIS_HOST` | `127.0.0.1` | Redis host (optional) |
-
-### AI Service (`ai-service/.env`)
-| Variable | Default | Description |
-|---|---|---|
-| `OPENROUTER_API_KEY` | *(required)* | Your OpenRouter API key |
-| `OPENROUTER_MODEL` | `google/gemini-2.0-flash-001` | Vision model to use |
-| `PORT` | `8000` | AI service port |
->>>>>>> fa46da8 (inital commit)
+## 🌐 Supported Platforms
+- ✅ YouTube
+- ✅ Instagram
+- ✅ TikTok
+- ✅ Twitter / X
+- ✅ Facebook
+- ✅ Reddit
+- ✅ Vimeo
+- ✅ Direct video links (.mp4, .webm, .mov)

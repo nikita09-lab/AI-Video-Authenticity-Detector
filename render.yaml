@@ -1,0 +1,71 @@
+# Render Blueprint — deploys all 3 services automatically
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+
+  # ─────────────────────────────────────────────
+  # 1. AI Inference Microservice (Python + FastAPI)
+  # ─────────────────────────────────────────────
+  - type: web
+    name: vidauth-ai-service
+    runtime: docker
+    dockerfilePath: ai-service/Dockerfile
+    dockerContext: .
+    plan: free
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false           # Set this manually in Render dashboard
+      - key: OPENROUTER_MODEL
+        value: google/gemini-2.0-flash-001
+      - key: PORT
+        value: 8000
+
+  # ─────────────────────────────────────────────
+  # 2. Backend API + Worker (Node.js + Fastify)
+  # ─────────────────────────────────────────────
+  - type: web
+    name: vidauth-backend
+    runtime: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: .
+    plan: free
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3001
+      - key: FFMPEG_PATH
+        value: ffmpeg
+      - key: YTDLP_PATH
+        value: yt-dlp
+      - key: TEMP_DIR
+        value: /tmp/vidauth
+      - key: MAX_FRAMES
+        value: 10              # lower for free tier speed
+      - key: MAX_DURATION_SEC
+        value: 120             # 2 min max for free tier
+      - key: MAX_FILE_SIZE
+        value: 52428800        # 50MB for free tier
+      - key: WORKER_CONCURRENCY
+        value: 1
+      # Set these in Render dashboard after deploying ai-service:
+      - key: AI_SERVICE_URL
+        sync: false
+      - key: CORS_ORIGIN
+        sync: false            # Set to your frontend URL
+
+  # ─────────────────────────────────────────────
+  # 3. Frontend (React + Vite — Static Site)
+  # ─────────────────────────────────────────────
+  - type: web
+    name: vidauth-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    plan: free
+    envVars:
+      # Set this in Render dashboard to your backend's URL:
+      # e.g. https://vidauth-backend.onrender.com
+      - key: VITE_API_BASE_URL
+        sync: false

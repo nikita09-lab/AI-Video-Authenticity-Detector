@@ -12,11 +12,12 @@ import logger from './logger.js';
 function getFFprobePath() {
     const ffmpegPath = config.processing.ffmpegPath;
     if (ffmpegPath.includes('/') || ffmpegPath.includes('\\')) {
-        // Absolute or relative path — derive ffprobe from same dir
+        // Absolute path — derive ffprobe from same directory, cross-platform
         const dir = dirname(ffmpegPath);
-        return join(dir, 'ffprobe.exe');
+        const ext = process.platform === 'win32' ? '.exe' : '';
+        return join(dir, `ffprobe${ext}`);
     }
-    // Simple command name — assume ffprobe is also in PATH
+    // Simple command name (e.g. 'ffmpeg') — assume ffprobe is also in PATH
     return 'ffprobe';
 }
 

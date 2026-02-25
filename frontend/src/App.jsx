@@ -80,9 +80,10 @@ export default function App() {
           </div>
 
           <a
-            href="https://github.com"
+            href="https://github.com/nikita09-lab/AI-Video-Authenticity-Detector"
             target="_blank"
             rel="noopener noreferrer"
+            title="View on GitHub"
             className="text-white/30 hover:text-white/60 transition-colors"
           >
             <Github className="w-5 h-5" />

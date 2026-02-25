@@ -183,81 +183,76 @@ async function downloadWithYtDlp(url, jobId) {
     const outputTemplate = join(downloadDir, `${jobId}.%(ext)s`);
 
     return new Promise((resolve, reject) => {
+        // Use configured yt-dlp path (standalone .exe recommended)
+        const ytdlpBin = config.processing.ytdlpPath || 'yt-dlp';
+        const ffmpegDir = config.processing.ffmpegPath.replace(/[/\\]ffmpeg(\.exe)?$/i, '');
+
         const args = [
             url,
             '-o', outputTemplate,
-            '-f', 'best[ext=mp4][filesize<100M]/best[ext=mp4]/best[filesize<100M]/best',  // prefer mp4 under 100MB
-            '--no-playlist',           // single video only
-            '--max-filesize', '100M',  // reject if over 100MB
+            // Use a pre-merged format (no A+V merging needed) to keep filename predictable
+            '-f', 'worst[ext=mp4]/worst[ext=webm]/worst/best[filesize<100M]/best',
+            '--no-playlist',
+            '--max-filesize', '100M',
             '--socket-timeout', '30',
             '--retries', '3',
             '--no-check-certificates',
             '--no-warnings',
-            '--quiet',
-            '--print', 'filename',     // print the final filename to stdout
-            '--ffmpeg-location', config.processing.ffmpegPath.replace(/ffmpeg\.exe$/, ''),
+            // Do NOT use --print or --quiet — they suppress the download itself
+            '--ffmpeg-location', ffmpegDir,
         ];
 
-        logger.info(`Running yt-dlp with args: ${args.join(' ')}`);
+        logger.info(`Running yt-dlp (${ytdlpBin}) for: ${url}`);
 
-        const proc = spawn('yt-dlp', args, {
-            timeout: 120000,  // 2 minute timeout
-            cwd: downloadDir,
+        const proc = spawn(ytdlpBin, args, {
+            timeout: 180000,  // 3 minute timeout
         });
 
-        let stdout = '';
         let stderr = '';
-
-        proc.stdout.on('data', (data) => { stdout += data.toString(); });
         proc.stderr.on('data', (data) => { stderr += data.toString(); });
+        // stdout is progress output — ignore it
+        proc.stdout.on('data', () => { });
 
         proc.on('close', async (code) => {
-            if (code !== 0) {
-                const errMsg = stderr.trim() || 'Unknown yt-dlp error';
+            // Find the downloaded file by scanning the download dir
+            const { readdir } = await import('fs/promises');
+            let downloadedFiles;
+            try { downloadedFiles = await readdir(downloadDir); } catch { downloadedFiles = []; }
 
-                // Provide user-friendly error messages
-                if (errMsg.includes('is not a valid URL') || errMsg.includes('Unsupported URL')) {
-                    reject(new Error('This URL is not supported. Please provide a valid YouTube, Instagram, TikTok, or direct video link.'));
-                } else if (errMsg.includes('Private video') || errMsg.includes('Sign in') || errMsg.includes('login')) {
-                    reject(new Error('This video is private or requires login. Please use a publicly accessible video URL.'));
-                } else if (errMsg.includes('Video unavailable') || errMsg.includes('removed')) {
-                    reject(new Error('This video is unavailable or has been removed.'));
-                } else if (errMsg.includes('age') || errMsg.includes('18')) {
-                    reject(new Error('This video is age-restricted. Cannot download without authentication.'));
-                } else if (errMsg.includes('429') || errMsg.includes('rate limit') || errMsg.includes('Too Many Requests')) {
-                    reject(new Error('Too many requests to this platform. Please try again in a few minutes.'));
-                } else {
-                    reject(new Error(`Failed to download video from platform: ${errMsg.slice(-200)}`));
-                }
+            const match = downloadedFiles.find(f => f.startsWith(jobId));
+            const fullPath = match ? join(downloadDir, match) : null;
+
+            // yt-dlp can exit with code 1 due to Python 3.9 deprecation warnings
+            // even when the download succeeded — so check file FIRST
+            if (fullPath) {
+                logger.info(`yt-dlp succeeded: ${fullPath}`);
+                resolve(fullPath);
                 return;
             }
 
-            // yt-dlp prints the filename to stdout
-            const downloadedFile = stdout.trim();
+            // File not found — it actually failed
+            const errMsg = stderr.trim() || 'Unknown yt-dlp error';
+            logger.error(`yt-dlp failed (code ${code}): ${errMsg}`);
 
-            if (!downloadedFile) {
-                // yt-dlp didn't print the filename — find the file ourselves
-                const { readdir } = await import('fs/promises');
-                const files = await readdir(downloadDir);
-                const match = files.find(f => f.startsWith(jobId));
-                if (match) {
-                    const fullPath = join(downloadDir, match);
-                    logger.info(`yt-dlp downloaded: ${fullPath}`);
-                    resolve(fullPath);
-                } else {
-                    reject(new Error('yt-dlp completed but no file was found. The video may not be downloadable.'));
-                }
-                return;
+            if (errMsg.includes('is not a valid URL') || errMsg.includes('Unsupported URL')) {
+                reject(new Error('This URL is not supported. Please try YouTube, Instagram, TikTok, Twitter/X, or a direct .mp4 link.'));
+            } else if (errMsg.includes('Private video') || errMsg.includes('Sign in') || errMsg.includes('login')) {
+                reject(new Error('This video is private or requires login. Please use a publicly accessible video URL.'));
+            } else if (errMsg.includes('Video unavailable') || errMsg.includes('removed')) {
+                reject(new Error('This video is unavailable or has been removed.'));
+            } else if (errMsg.includes('403') || errMsg.includes('Forbidden')) {
+                reject(new Error('Access denied by the platform. This video may be restricted.'));
+            } else if (errMsg.includes('429') || errMsg.includes('rate limit') || errMsg.includes('Too Many Requests')) {
+                reject(new Error('Too many requests to this platform. Please try again in a few minutes.'));
+            } else {
+                reject(new Error(`Failed to download video: ${errMsg.slice(-300)}`));
             }
-
-            logger.info(`yt-dlp downloaded: ${downloadedFile}`);
-            resolve(downloadedFile);
         });
 
         proc.on('error', (err) => {
             if (err.message.includes('ENOENT')) {
                 reject(new Error(
-                    'yt-dlp is not installed. Please install it: pip install yt-dlp'
+                    `yt-dlp not found at: ${ytdlpBin}. Please check YTDLP_PATH in backend/.env`
                 ));
             } else {
                 reject(new Error(`yt-dlp error: ${err.message}`));

@@ -1,8 +1,9 @@
 import axios from 'axios';
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+// Use env var if set, otherwise fall back to '' so the Vite proxy handles /api/* → localhost:3001
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 const api = axios.create({
-  baseURL: `${API_BASE_URL}/api/v1`,
-  timeout: 120000,
+    baseURL: `${API_BASE_URL}/api/v1`,
+    timeout: 120000,
 });
 
 /**

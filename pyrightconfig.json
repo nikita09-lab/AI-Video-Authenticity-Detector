@@ -1,8 +1,8 @@
 {
-    "pythonVersion": "3.9",
+    "pythonVersion": "3.11",
     "pythonPlatform": "Windows",
     "extraPaths": [
-        "C:\\Users\\Sneha\\AppData\\Local\\Programs\\Python\\Python39\\Lib\\site-packages",
+        "C:\\Users\\Sneha\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages",
         "./ai-service"
     ],
     "exclude": [
